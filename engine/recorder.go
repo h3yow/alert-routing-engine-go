@@ -12,10 +12,15 @@ import (
 // and the notifications produced. Distinct outcome values keep repeated,
 // out-of-order and orphan-recovery cases from swallowing one another.
 type Decision struct {
-	Alert    alert.Alert
-	Outcome  alert.Outcome
-	RuleID   string
-	Reason   string
+	Alert   alert.Alert
+	Outcome alert.Outcome
+	// Round is the fault episode (1-based) this input event was judged
+	// against: 0 for an orphan recovery that opens no real round.
+	Round  int
+	RuleID string
+	Reason string
+	// Messages holds the notifications produced; for a multi-round
+	// fingerprint every round produces its own firing/resolution pair.
 	Messages []notify.Notification
 }
 

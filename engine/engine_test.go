@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -18,8 +19,8 @@ var t0 = time.Date(2026, 9, 28, 8, 0, 0, 0, time.UTC)
 // logDecision prints each input event and the engine's judgment basis.
 func logDecision(t *testing.T, a alert.Alert, d Decision) {
 	t.Helper()
-	t.Logf("input kind=%s fp=%s labels=%v => outcome=%s rule=%q reason=%q messages=%d",
-		a.Kind, a.Fingerprint, a.Labels, d.Outcome, d.RuleID, d.Reason, len(d.Messages))
+	t.Logf("input kind=%s fp=%s labels=%v => round=%d outcome=%s rule=%q reason=%q messages=%d",
+		a.Kind, a.Fingerprint, a.Labels, d.Round, d.Outcome, d.RuleID, d.Reason, len(d.Messages))
 }
 
 type testChannel struct {
@@ -449,5 +450,351 @@ func TestConcurrentProducersNoDuplicates(t *testing.T) {
 	}
 	if ch.sentCount() != 1 {
 		t.Fatalf("channel sends = %d, want 1", ch.sentCount())
+	}
+}
+
+// orderedChannel records every delivered notification as a (kind, round)
+// mark, in delivery order. Appends are mutex-protected so -race verifies
+// that same-group deliveries never overlap.
+type orderedChannel struct {
+	mu     sync.Mutex
+	name   string
+	marks  []string
+	groups map[string]int
+}
+
+func newOrderedChannel(name string) *orderedChannel {
+	return &orderedChannel{name: name, groups: map[string]int{}}
+}
+
+func (c *orderedChannel) Name() string { return c.name }
+func (c *orderedChannel) Send(ctx context.Context, n notify.Notification) error {
+	mark := fmt.Sprintf("g=%s r=%d %s", n.Group, n.Round, n.Kind)
+	c.mu.Lock()
+	c.marks = append(c.marks, mark)
+	c.groups[n.Group]++
+	c.mu.Unlock()
+	// Yield (never sleep) to widen the overlap window for -race.
+	runtime.Gosched()
+	return nil
+}
+
+func (c *orderedChannel) marksCopy() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.marks...)
+}
+
+func TestMultiRoundFaultNotifiesEachRoundAndKeepsHistory(t *testing.T) {
+	fc := clock.NewFakeClock(t0)
+	ch := newOrderedChannel("mem")
+	e, rec := newTestEngine(t, fc, []notify.Channel{ch}, nil, notify.DefaultConfig())
+	ctx := context.Background()
+	ls := map[string]string{"alertname": "Flap", "host": "n1"}
+
+	const rounds = 3
+	var wantOutcomes []alert.Outcome
+	for r := 1; r <= rounds; r++ {
+		d := e.Ingest(ctx, firing("f", ls))
+		logDecision(t, firing("f", ls), d)
+		if d.Outcome != alert.OutcomeNotified || d.Round != r {
+			t.Fatalf("round %d firing = %s (round=%d), want notified round %d", r, d.Outcome, d.Round, r)
+		}
+		wantOutcomes = append(wantOutcomes, alert.OutcomeNotified)
+
+		// Repeat firings within the open round stay duplicates of THIS
+		// round: the prior round's latch must not dedupe the new round, and
+		// the new round's latch must still dedupe repeats.
+		d = e.Ingest(ctx, firing("f", ls))
+		logDecision(t, firing("f", ls), d)
+		if d.Outcome != alert.OutcomeDuplicate || d.Round != r {
+			t.Fatalf("round %d repeat firing = %s, want duplicate in same round", r, d.Outcome)
+		}
+		wantOutcomes = append(wantOutcomes, alert.OutcomeDuplicate)
+
+		d = e.Ingest(ctx, resolved("f", ls))
+		logDecision(t, resolved("f", ls), d)
+		if d.Outcome != alert.OutcomeResolvedNotification || d.Round != r {
+			t.Fatalf("round %d resolve = %s, want resolved_notification round %d", r, d.Outcome, r)
+		}
+		wantOutcomes = append(wantOutcomes, alert.OutcomeResolvedNotification)
+
+		// Repeated recovery after the round closed stays a duplicate and
+		// never opens or advances a round.
+		d = e.Ingest(ctx, resolved("f", ls))
+		logDecision(t, resolved("f", ls), d)
+		if d.Outcome != alert.OutcomeDuplicate || d.Round != r {
+			t.Fatalf("round %d repeat resolve = %s, want duplicate", r, d.Outcome)
+		}
+		wantOutcomes = append(wantOutcomes, alert.OutcomeDuplicate)
+	}
+	settle(t, e, fc)
+
+	if got := outcomes(rec); fmt.Sprint(got) != fmt.Sprint(wantOutcomes) {
+		t.Fatalf("outcomes = %v\nwant %v", got, wantOutcomes)
+	}
+
+	// Exactly one firing + one resolution delivery per round.
+	marks := ch.marksCopy()
+	if len(marks) != rounds*2 {
+		t.Fatalf("deliveries = %d, want %d (marks=%v)", len(marks), rounds*2, marks)
+	}
+	wantMarks := make([]string, 0, rounds*2)
+	for r := 1; r <= rounds; r++ {
+		wantMarks = append(wantMarks,
+			fmt.Sprintf("g=%s r=%d %s", alert.GroupKey(ls, []string{"alertname", "host"}), r, alert.KindFiring),
+			fmt.Sprintf("g=%s r=%d %s", alert.GroupKey(ls, []string{"alertname", "host"}), r, alert.KindResolved),
+		)
+	}
+	if fmt.Sprint(marks) != fmt.Sprint(wantMarks) {
+		t.Fatalf("delivery order mismatch:\n got %v\nwant %v", marks, wantMarks)
+	}
+
+	// State: latest round is resolved; every prior round frozen with its
+	// own per-round notification flags, none overwritten.
+	entry := e.State()["f"]
+	if entry.Round != rounds || entry.Status != alert.StateResolved || entry.Orphan {
+		t.Fatalf("final entry = round %d %s orphan=%v", entry.Round, entry.Status, entry.Orphan)
+	}
+	all := entry.AllRounds()
+	if len(all) != rounds {
+		t.Fatalf("stored rounds = %d, want %d", len(all), rounds)
+	}
+	for i, rd := range all {
+		if rd.Number != i+1 || !rd.FiringNotified || !rd.ResolveNotified || rd.Status != alert.StateResolved {
+			t.Fatalf("round view wrong: %+v", rd)
+		}
+	}
+}
+
+func TestNewRoundRejudgedAgainstCurrentRules(t *testing.T) {
+	fc := clock.NewFakeClock(t0)
+	ch := &testChannel{name: "mem"}
+	rec := NewRecorder()
+	dcfg := notify.Config{MaxAttempts: 1, BaseBackoff: time.Millisecond, MaxBackoff: time.Millisecond}
+	e := NewWithDispatchConfig(fc, []notify.Channel{ch}, rule.Empty,
+		Config{GroupBy: []string{"host"}}, dcfg, rec)
+	defer e.Close()
+	ctx := context.Background()
+	ls := map[string]string{"host": "n1", "alertname": "X"}
+
+	// Round 1 under empty ruleset: fires and resolves, both notified.
+	d := e.Ingest(ctx, firing("f", ls))
+	logDecision(t, firing("f", ls), d)
+	if d.Outcome != alert.OutcomeNotified || d.Round != 1 {
+		t.Fatalf("round1 firing = %s", d.Outcome)
+	}
+	d = e.Ingest(ctx, resolved("f", ls))
+	logDecision(t, resolved("f", ls), d)
+	if d.Outcome != alert.OutcomeResolvedNotification || d.Round != 1 {
+		t.Fatalf("round1 resolve = %s", d.Outcome)
+	}
+	before := ch.sentCount()
+
+	// Reload BEFORE round 2 opens: silence the host. Round 2 must be judged
+	// on its own arrival: silenced, not a duplicate of round 1, and its
+	// resolution must be resolved_no_notification -- the reload never
+	// retroactively changes round 1 (already delivered, count stays).
+	e.Reload(rule.NewMatchers([]rule.SilenceRule{{
+		ID: "s1", Equal: map[string]string{"host": "n1"},
+		StartsAt: t0.Add(-time.Hour), EndsAt: t0.Add(time.Hour),
+	}}, nil))
+
+	d = e.Ingest(ctx, firing("f", ls))
+	logDecision(t, firing("f", ls), d)
+	if d.Outcome != alert.OutcomeSilenced || d.Round != 2 || d.RuleID != "s1" {
+		t.Fatalf("round2 firing under new rules = %s/%s round=%d, want silenced/s1 round2", d.Outcome, d.RuleID, d.Round)
+	}
+	d = e.Ingest(ctx, resolved("f", ls))
+	logDecision(t, resolved("f", ls), d)
+	if d.Outcome != alert.OutcomeResolvedNoNotification || d.Round != 2 {
+		t.Fatalf("round2 resolve = %s round=%d, want resolved_no_notification round2", d.Outcome, d.Round)
+	}
+	if ch.sentCount() != before {
+		t.Fatalf("muted round 2 produced deliveries: %d -> %d", before, ch.sentCount())
+	}
+
+	// Round 3 after silence removed: notifies again as its own round.
+	e.Reload(rule.Empty)
+	d = e.Ingest(ctx, firing("f", ls))
+	logDecision(t, firing("f", ls), d)
+	if d.Outcome != alert.OutcomeNotified || d.Round != 3 {
+		t.Fatalf("round3 firing = %s round=%d, want notified round3", d.Outcome, d.Round)
+	}
+	d = e.Ingest(ctx, resolved("f", ls))
+	logDecision(t, resolved("f", ls), d)
+	if d.Outcome != alert.OutcomeResolvedNotification || d.Round != 3 {
+		t.Fatalf("round3 resolve = %s", d.Outcome)
+	}
+	if ch.sentCount() != before+2 {
+		t.Fatalf("round3 deliveries wrong: %d, want %d", ch.sentCount(), before+2)
+	}
+
+	all := e.State()["f"].AllRounds()
+	if len(all) != 3 {
+		t.Fatalf("history rounds = %d, want 3", len(all))
+	}
+	if !all[0].FiringNotified || all[1].FiringNotified || !all[2].FiringNotified {
+		t.Fatalf("per-round latches wrong: %+v %+v %+v", all[0], all[1], all[2])
+	}
+}
+
+// gateChannel blocks all sends until released, and records whether sends
+// for distinct groups ever overlapped.
+type gateChannel struct {
+	mu       sync.Mutex
+	name     string
+	active   map[string]int
+	maxGroup map[string]int
+	gate     <-chan struct{}
+	entered  chan string
+}
+
+func newGateChannel(name string, gate <-chan struct{}) *gateChannel {
+	return &gateChannel{name: name, gate: gate, entered: make(chan string, 64), active: map[string]int{}, maxGroup: map[string]int{}}
+}
+
+func (c *gateChannel) Name() string { return c.name }
+func (c *gateChannel) Send(ctx context.Context, n notify.Notification) error {
+	c.mu.Lock()
+	c.active[n.Group]++
+	if c.active[n.Group] > c.maxGroup[n.Group] {
+		c.maxGroup[n.Group] = c.active[n.Group]
+	}
+	c.mu.Unlock()
+	c.entered <- n.Group
+	<-c.gate // hold the delivery until the test releases the gate
+	c.mu.Lock()
+	c.active[n.Group]--
+	c.mu.Unlock()
+	return nil
+}
+
+func TestSlowGroupDoesNotBlockOtherGroups(t *testing.T) {
+	// One channel, two groups. Group A is held mid-delivery; group B must
+	// still complete on the same channel because serialization is per
+	// (channel, group), never global per channel.
+	gate := make(chan struct{})
+	ch := newGateChannel("mem", gate)
+	d := notify.NewDispatcher(clock.NewRealClock(), []notify.Channel{ch}, notify.DefaultConfig())
+	defer d.Stop()
+
+	d.DispatchAsync(notify.Notification{ID: "a", Fingerprint: "a", Group: "A", Kind: alert.KindFiring}, nil)
+	<-ch.entered // A's delivery is now in flight and blocked
+
+	finished := make(chan struct{})
+	go func() {
+		d.Dispatch(notify.Notification{ID: "b", Fingerprint: "b", Group: "B", Kind: alert.KindFiring}, nil)
+		close(finished)
+	}()
+	// B must reach Send (its own group lock) while A is still blocked.
+	select {
+	case <-ch.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("group B delivery never started while group A was blocked")
+	}
+	// Releasing the gate lets both in-flight sends complete; B must then
+	// finish promptly rather than having queued behind A's group lock.
+	close(gate)
+	select {
+	case <-finished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("group B delivery blocked behind group A on the same channel")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := d.Idle(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestConcurrentFlappingAcrossProducersAndChannels(t *testing.T) {
+	fc := clock.NewFakeClock(t0)
+	chA := newOrderedChannel("a")
+	chB := newOrderedChannel("b")
+	rec := NewRecorder()
+	dcfg := notify.Config{MaxAttempts: 1, BaseBackoff: time.Millisecond, MaxBackoff: time.Millisecond}
+	e := NewWithDispatchConfig(fc, []notify.Channel{chA, chB}, rule.Empty,
+		Config{GroupBy: []string{"host"}}, dcfg, rec)
+	defer e.Close()
+
+	const rounds = 4
+	var wg sync.WaitGroup
+	// Producers repeatedly push the lifecycle events for ONE fingerprint in
+	// any interleaving. Each phase starts only after the previous one
+	// settles at the decision level, so exactly `rounds` full episodes must
+	// form; within a phase duplicates collapse, across phases they cannot.
+	fp := "flap"
+	ls := map[string]string{"host": "n1", "alertname": "Flap"}
+	for r := 1; r <= rounds; r++ {
+		// Firing phase: many producers, one must open/notify the round,
+		// all others are within-round duplicates.
+		for p := 0; p < 8; p++ {
+			wg.Add(1)
+			go func() { defer wg.Done(); _ = e.Ingest(context.Background(), firing(fp, ls)) }()
+		}
+		wg.Wait()
+		// Recovery phase.
+		for p := 0; p < 8; p++ {
+			wg.Add(1)
+			go func() { defer wg.Done(); _ = e.Ingest(context.Background(), resolved(fp, ls)) }()
+		}
+		wg.Wait()
+	}
+	settle(t, e, fc)
+
+	// Decision counts: one opening firing and one closing resolution per
+	// round; every other event is a same-round duplicate. No orphan and no
+	// out-of-order outcome may appear.
+	var notified, resolvedNotif, dup, other int
+	for _, d := range rec.Decisions() {
+		switch d.Outcome {
+		case alert.OutcomeNotified:
+			notified++
+		case alert.OutcomeResolvedNotification:
+			resolvedNotif++
+		case alert.OutcomeDuplicate:
+			dup++
+		default:
+			other++
+			t.Errorf("unexpected outcome under flapping concurrency: round=%d %s", d.Round, d.Outcome)
+		}
+	}
+	if notified != rounds || resolvedNotif != rounds {
+		t.Fatalf("notified=%d resolvedNotif=%d, want %d each", notified, resolvedNotif, rounds)
+	}
+	if dup != 16*rounds-2*rounds {
+		t.Fatalf("duplicates = %d, want %d", dup, 16*rounds-2*rounds)
+	}
+	if other != 0 {
+		t.Fatalf("non lifecycle outcomes: %d", other)
+	}
+
+	// Per channel: exactly one firing and one resolution PER ROUND, and the
+	// observed order must track the state evolution: firing N before
+	// resolution N before firing N+1.
+	group := alert.GroupKey(ls, []string{"host"})
+	wantSeq := make([]string, 0, rounds*2)
+	for r := 1; r <= rounds; r++ {
+		wantSeq = append(wantSeq,
+			fmt.Sprintf("g=%s r=%d %s", group, r, alert.KindFiring),
+			fmt.Sprintf("g=%s r=%d %s", group, r, alert.KindResolved))
+	}
+	for _, ch := range []*orderedChannel{chA, chB} {
+		got := ch.marksCopy()
+		if len(got) != rounds*2 {
+			t.Fatalf("channel %s got %d deliveries, want %d: %v", ch.name, len(got), rounds*2, got)
+		}
+		if fmt.Sprint(got) != fmt.Sprint(wantSeq) {
+			t.Fatalf("channel %s order mismatch:\n got %v\nwant %v", ch.name, got, wantSeq)
+		}
+	}
+
+	entry := e.State()[fp]
+	if entry.Round != rounds || entry.Status != alert.StateResolved {
+		t.Fatalf("final state = round %d %s", entry.Round, entry.Status)
+	}
+	if len(entry.AllRounds()) != rounds {
+		t.Fatalf("history = %d rounds, want %d", len(entry.AllRounds()), rounds)
 	}
 }

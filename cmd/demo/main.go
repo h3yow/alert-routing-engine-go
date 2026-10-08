@@ -75,18 +75,30 @@ func main() {
 	ctx := context.Background()
 	events := []alert.Alert{
 		mkAlert("cpu-1", alert.KindFiring, map[string]string{"alertname": "CPUHigh", "host": "node-1", "severity": "warning"}, now),
-		mkAlert("cpu-1", alert.KindFiring, map[string]string{"alertname": "CPUHigh", "host": "node-1", "severity": "warning"}, now), // duplicate
+		mkAlert("cpu-1", alert.KindFiring, map[string]string{"alertname": "CPUHigh", "host": "node-1", "severity": "warning"}, now), // duplicate within round 1
 		mkAlert("cpu-2", alert.KindFiring, map[string]string{"alertname": "NodeDown", "host": "node-1", "severity": "critical"}, now),
 		mkAlert("cpu-3", alert.KindFiring, map[string]string{"alertname": "CPUHigh", "host": "node-1", "severity": "warning"}, now),   // inhibited by cpu-2
 		mkAlert("cpu-4", alert.KindFiring, map[string]string{"alertname": "DiskFull", "host": "node-3", "severity": "critical"}, now), // silenced
 		mkAlert("ghost", alert.KindResolved, map[string]string{"alertname": "Mystery", "host": "node-9"}, now),                        // orphan
-		mkAlert("cpu-1", alert.KindResolved, map[string]string{"alertname": "CPUHigh", "host": "node-1", "severity": "warning"}, now), // resolution
-		mkAlert("cpu-1", alert.KindFiring, map[string]string{"alertname": "CPUHigh", "host": "node-1", "severity": "warning"}, now),   // out of order
+		mkAlert("cpu-1", alert.KindResolved, map[string]string{"alertname": "CPUHigh", "host": "node-1", "severity": "warning"}, now), // closes round 1
+		mkAlert("ghost", alert.KindFiring, map[string]string{"alertname": "Mystery", "host": "node-9"}, now),                          // out of order (orphan never opens a round)
+
+		// Flapping condition: round 2 and round 3 of the SAME fingerprint.
+		// Each round notifies its own firing and its own resolution.
+		mkAlert("flap-1", alert.KindFiring, map[string]string{"alertname": "NetBurst", "host": "node-2"}, now),
+		mkAlert("flap-1", alert.KindResolved, map[string]string{"alertname": "NetBurst", "host": "node-2"}, now),
+		mkAlert("flap-1", alert.KindFiring, map[string]string{"alertname": "NetBurst", "host": "node-2"}, now),
+		mkAlert("flap-1", alert.KindResolved, map[string]string{"alertname": "NetBurst", "host": "node-2"}, now),
+
+		// cpu-1 flaps as well: this firing opens round 2 after round 1's
+		// recovery, and is notified (not a duplicate, not out of order).
+		mkAlert("cpu-1", alert.KindFiring, map[string]string{"alertname": "CPUHigh", "host": "node-1", "severity": "warning"}, now),
+		mkAlert("cpu-1", alert.KindResolved, map[string]string{"alertname": "CPUHigh", "host": "node-1", "severity": "warning"}, now),
 	}
 
 	for _, a := range events {
 		d := eng.Ingest(ctx, a)
-		fmt.Printf("ingest kind=%-8s fp=%-6s -> outcome=%s reason=%s\n", a.Kind, a.Fingerprint, d.Outcome, d.Reason)
+		fmt.Printf("ingest kind=%-8s fp=%-6s round=%d -> outcome=%s reason=%s\n", a.Kind, a.Fingerprint, d.Round, d.Outcome, d.Reason)
 	}
 
 	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -99,10 +111,10 @@ func main() {
 	for _, r := range rec.Results() {
 		switch {
 		case r.Delivered:
-			fmt.Printf("DELIVERED channel=%s id=%s attempts=%d\n", r.Channel, r.Notification.ID, r.Attempts)
+			fmt.Printf("DELIVERED channel=%s round=%d id=%s attempts=%d\n", r.Channel, r.Notification.Round, r.Notification.ID, r.Attempts)
 		default:
-			fmt.Printf("DROPPED   channel=%s id=%s reason=%s attempts=%d err=%v\n",
-				r.Channel, r.Notification.ID, r.DropReason, r.Attempts, r.Err)
+			fmt.Printf("DROPPED   channel=%s round=%d id=%s reason=%s attempts=%d err=%v\n",
+				r.Channel, r.Notification.Round, r.Notification.ID, r.DropReason, r.Attempts, r.Err)
 		}
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/h3yow/alert-routing-engine-go/alert"
 	"github.com/h3yow/alert-routing-engine-go/clock"
@@ -25,10 +26,15 @@ type Config struct {
 //
 // State transitions are serialized inside the store's write lock, so any
 // number of producers may call Ingest concurrently without torn updates.
-// Dispatch inputs (the notification value) are fixed under that lock and
-// delivery itself is asynchronous, so no two events can produce duplicate
-// messages for one fingerprint. Reload only swaps an atomic rule pointer;
-// an event evaluates against the snapshot it captured on entry.
+// In addition, events for one fingerprint are serialized by a dedicated
+// mutex for the whole "decide then dispatch" span: with multi-round faults
+// this guarantees that, per channel, round N's resolution is always
+// delivered before round N+1's firing even when producers race. Different
+// fingerprints still process in parallel (a slow channel blocks only the
+// fingerprint currently delivering). Dispatch inputs (the notification
+// value) are fixed under the store lock; delivery itself never mutates the
+// store. Reload only swaps an atomic rule pointer; an event evaluates
+// against the snapshot it captured on entry.
 type Engine struct {
 	clk      clock.Clock
 	store    *state.Store
@@ -36,6 +42,11 @@ type Engine struct {
 	rec      *Recorder
 	groupBy  []string
 	notifSeq uint64
+
+	// fpMu holds one *sync.Mutex per fingerprint, serializing the
+	// decide-and-deliver span per fingerprint. Independent fingerprints
+	// use independent mutexes and never block one another.
+	fpMu sync.Map // string -> *sync.Mutex
 
 	mu    sync.Mutex
 	rules *rule.Matchers
@@ -94,6 +105,17 @@ func (e *Engine) currentRules() *rule.Matchers {
 	return r
 }
 
+// lockFingerprint serializes the whole decide-and-deliver span for one
+// fingerprint. Only same-fingerprint events contend; the lock is never
+// taken while holding the store lock, so distinct fingerprints (distinct
+// faults, distinct groups) keep flowing in parallel.
+func (e *Engine) lockFingerprint(fp string) func() {
+	v, _ := e.fpMu.LoadOrStore(fp, &sync.Mutex{})
+	m := v.(*sync.Mutex)
+	m.Lock()
+	return m.Unlock
+}
+
 // ReplaceChannels atomically swaps notification channels.
 func (e *Engine) ReplaceChannels(channels []notify.Channel) {
 	e.disp.ReplaceChannels(channels)
@@ -112,11 +134,23 @@ func (e *Engine) Reload(rules *rule.Matchers) {
 }
 
 // Ingest processes one trigger/recovery event and records its conclusion.
+//
+// Events for one fingerprint take that fingerprint's lock for the whole
+// decide-and-deliver span, so racing producers can never deliver round
+// N+1's firing before round N's resolution. The lock is per fingerprint:
+// different faults and different groups stay parallel end to end.
 func (e *Engine) Ingest(ctx context.Context, a alert.Alert) Decision {
+	unlock := e.lockFingerprint(a.Fingerprint)
+	defer unlock()
+
+	var d Decision
 	if a.Firing() {
-		return e.ingestFiring(a)
+		d = e.ingestFiring(a)
+	} else {
+		d = e.ingestResolved(a)
 	}
-	return e.ingestResolved(a)
+	e.finalize(d)
+	return d
 }
 
 func (e *Engine) ingestFiring(a alert.Alert) Decision {
@@ -126,20 +160,45 @@ func (e *Engine) ingestFiring(a alert.Alert) Decision {
 	var decision Decision
 	e.store.Apply(a.Fingerprint, true, func(en *state.Entry, existed bool, active state.ActiveLabelsFunc) {
 		if existed && en.Status == alert.StateResolved {
-			// Recovery already on record: this firing is out of order.
-			// It resurrects nothing and notifies nothing; payload is left
-			// untouched (distinct from duplicate handling below).
 			en.LastSeen = now
-			decision = Decision{
-				Alert:   en.Alert,
-				Outcome: alert.OutcomeOutOfOrder,
-				Reason:  "firing arrives after resolved state; state left unchanged, no notification",
+			if en.Orphan {
+				// The resolved state was born from an orphan recovery: a
+				// firing can never legitimately open a round for it. This
+				// stays out_of_order even though non-orphan resolved states
+				// allow a new round to start; the two conclusions are kept
+				// distinct on purpose.
+				decision = Decision{
+					Alert:   en.Alert,
+					Round:   en.Round,
+					Outcome: alert.OutcomeOutOfOrder,
+					Reason:  "firing arrives after an orphan recovery; no round opens, state left unchanged, no notification",
+				}
+				return
 			}
+
+			// A completed, real round followed by a new firing: open the
+			// next round. Freeze the finished round in History first; it is
+			// never mutated again. The new round gets fresh latches and is
+			// evaluated against the rules active at ITS arrival.
+			en.History = append(en.History, en.CurrentRound())
+			en.Round++
+			en.Alert = a
+			en.OpenedAt = now
+			en.ResolvedAt = time.Time{}
+			en.LastSeen = now
+			en.UpdatedAt = now
+			en.Status = alert.StatePending
+			en.Notified = false
+			en.Orphan = false
+			en.Suppressed, en.SuppressBy = false, ""
+			en.Silenced, en.SilenceBy = false, ""
+			decision = e.evaluateFiring(en, rules, active, now,
+				"new round "+strconv.Itoa(en.Round)+" opens after prior recovery; firing notification dispatched")
 			return
 		}
 
 		if existed {
-			// Refresh label/timing payload but keep the Notified latch.
+			// Same round: refresh label/timing payload but keep its latches.
 			en.Alert = mergeAlert(en.Alert, a)
 			en.LastSeen = now
 			en.UpdatedAt = now
@@ -149,49 +208,60 @@ func (e *Engine) ingestFiring(a alert.Alert) Decision {
 			en.LastSeen = now
 			en.UpdatedAt = now
 			en.Status = alert.StatePending
+			en.Round = 1
+			en.OpenedAt = now
 		}
 
-		// Repeat firing of an active, already-notified condition.
-		if en.Notified {
-			decision = Decision{
-				Alert:   en.Alert,
-				Outcome: alert.OutcomeDuplicate,
-				Reason:  "pending fingerprint already notified; repeat firing deduped",
-			}
-			return
-		}
-
-		// Pending but never notified (earlier events were muted). Evaluate
-		// current rules: still muted -> muted duplicate; cleared -> first
-		// notification happens now.
-		if sid := rules.MatchSilence(en.Alert.Labels, now); sid != "" {
-			en.Silenced, en.SilenceBy = true, sid
-			en.Suppressed, en.SuppressBy = false, ""
-			decision = Decision{
-				Alert:   en.Alert,
-				Outcome: alert.OutcomeSilenced,
-				RuleID:  sid,
-				Reason:  "firing matches active silence " + sid + "; tracked, no notification",
-			}
-			return
-		}
-		if iid := e.matchInhibit(rules, en, active); iid != "" {
-			en.Suppressed, en.SuppressBy = true, iid
-			en.Silenced, en.SilenceBy = false, ""
-			decision = Decision{
-				Alert:   en.Alert,
-				Outcome: alert.OutcomeSuppressed,
-				RuleID:  iid,
-				Reason:  "firing inhibited by active source via rule " + iid + "; tracked, no notification",
-			}
-			return
-		}
-
-		decision = e.fireNotification(en, "firing passes silence then inhibition; dispatch")
+		decision = e.evaluateFiring(en, rules, active, now,
+			"round "+strconv.Itoa(en.Round)+" firing passes silence then inhibition; dispatch")
 	})
 
-	e.finalize(decision)
 	return decision
+}
+
+// evaluateFiring applies the within-round policy order to the current
+// (always pending) round: notified latch first, then silence, then
+// inhibition, then a real firing notification. Called only inside a
+// store.Apply callback.
+func (e *Engine) evaluateFiring(en *state.Entry, rules *rule.Matchers, active state.ActiveLabelsFunc, now time.Time, notifyReason string) Decision {
+	// Repeat firing of an active, already-notified round. The latch is
+	// per round: a later round never reaches here against an old latch.
+	if en.Notified {
+		return Decision{
+			Alert:   en.Alert,
+			Round:   en.Round,
+			Outcome: alert.OutcomeDuplicate,
+			Reason:  "pending round " + strconv.Itoa(en.Round) + " already notified; repeat firing deduped within the round",
+		}
+	}
+
+	// Pending but never notified (earlier events of THIS round were muted).
+	// Evaluate the rules captured at this event's arrival: still muted ->
+	// muted duplicate; cleared -> the round's first notification happens now.
+	if sid := rules.MatchSilence(en.Alert.Labels, now); sid != "" {
+		en.Silenced, en.SilenceBy = true, sid
+		en.Suppressed, en.SuppressBy = false, ""
+		return Decision{
+			Alert:   en.Alert,
+			Round:   en.Round,
+			Outcome: alert.OutcomeSilenced,
+			RuleID:  sid,
+			Reason:  "round " + strconv.Itoa(en.Round) + " firing matches active silence " + sid + "; tracked, no notification",
+		}
+	}
+	if iid := e.matchInhibit(rules, en, active); iid != "" {
+		en.Suppressed, en.SuppressBy = true, iid
+		en.Silenced, en.SilenceBy = false, ""
+		return Decision{
+			Alert:   en.Alert,
+			Round:   en.Round,
+			Outcome: alert.OutcomeSuppressed,
+			RuleID:  iid,
+			Reason:  "round " + strconv.Itoa(en.Round) + " firing inhibited by active source via rule " + iid + "; tracked, no notification",
+		}
+	}
+
+	return e.fireNotification(en, notifyReason)
 }
 
 func (e *Engine) ingestResolved(a alert.Alert) Decision {
@@ -200,18 +270,24 @@ func (e *Engine) ingestResolved(a alert.Alert) Decision {
 	var decision Decision
 	e.store.Apply(a.Fingerprint, true, func(en *state.Entry, existed bool, active state.ActiveLabelsFunc) {
 		if !existed {
-			// First sighting is a recovery: orphan. Track it in resolved
-			// state so repeated recoveries become explicit duplicates and
-			// later firings are explicit out-of-order events.
+			// First sighting is a recovery: orphan. Track it as a record-only
+			// resolved episode (round 0, Orphan) so repeated recoveries are
+			// explicit duplicates and later firings are explicit
+			// out-of-order events; neither path opens a real new round.
 			en.Alert = a
 			en.FirstSeen = now
 			en.LastSeen = now
 			en.UpdatedAt = now
 			en.Status = alert.StateResolved
+			en.Round = 0
+			en.OpenedAt = now
+			en.ResolvedAt = now
+			en.Orphan = true
 			decision = Decision{
 				Alert:   a,
+				Round:   0,
 				Outcome: alert.OutcomeOrphanResolve,
-				Reason:  "recovery with no prior firing; tracked as resolved, no notification",
+				Reason:  "recovery with no prior firing; tracked as record-only resolved, no notification",
 			}
 			return
 		}
@@ -220,17 +296,19 @@ func (e *Engine) ingestResolved(a alert.Alert) Decision {
 			en.LastSeen = now
 			decision = Decision{
 				Alert:   en.Alert,
+				Round:   en.Round,
 				Outcome: alert.OutcomeDuplicate,
-				Reason:  "recovery for already-resolved fingerprint; duplicate recovery",
+				Reason:  "recovery for already-resolved round " + strconv.Itoa(en.Round) + "; duplicate recovery",
 			}
 			return
 		}
 
-		// Pending -> resolved.
+		// Pending -> resolved: close exactly the current round.
 		en.Alert = mergeAlert(en.Alert, a)
 		en.LastSeen = now
 		en.UpdatedAt = now
 		en.Status = alert.StateResolved
+		en.ResolvedAt = now
 
 		if !en.Notified {
 			// Muted its entire active life; nothing fired, nothing recovers.
@@ -240,16 +318,17 @@ func (e *Engine) ingestResolved(a alert.Alert) Decision {
 			}
 			decision = Decision{
 				Alert:   en.Alert,
+				Round:   en.Round,
 				Outcome: alert.OutcomeResolvedNoNotification,
 				RuleID:  ruleID,
-				Reason:  "resolved while muted for whole active life; no prior firing notification",
+				Reason:  "round " + strconv.Itoa(en.Round) + " resolved while muted for whole active life; no prior firing notification",
 			}
 			return
 		}
-		decision = e.resolveNotification(en, "recovery matches prior firing; resolution notification dispatched")
+		decision = e.resolveNotification(en,
+			"recovery closes round "+strconv.Itoa(en.Round)+"; resolution notification dispatched")
 	})
 
-	e.finalize(decision)
 	return decision
 }
 
@@ -267,15 +346,16 @@ func (e *Engine) matchInhibit(rules *rule.Matchers, en *state.Entry, active stat
 	return rules.MatchInhibit(en.Alert.Labels, sources)
 }
 
-// fireNotification latches notification and builds a firing decision.
-// Called only within a store.Apply callback.
+// fireNotification latches the current round's firing and builds its
+// decision. Called only within a store.Apply callback.
 func (e *Engine) fireNotification(en *state.Entry, reason string) Decision {
 	en.Notified = true
 	en.Suppressed, en.SuppressBy = false, ""
 	en.Silenced, en.SilenceBy = false, ""
-	n := e.makeNotification(en.Alert, alert.KindFiring)
+	n := e.makeNotification(en.Alert, alert.KindFiring, en.Round)
 	return Decision{
 		Alert:    en.Alert,
+		Round:    en.Round,
 		Outcome:  alert.OutcomeNotified,
 		Reason:   reason,
 		Messages: []notify.Notification{n},
@@ -283,51 +363,61 @@ func (e *Engine) fireNotification(en *state.Entry, reason string) Decision {
 }
 
 func (e *Engine) resolveNotification(en *state.Entry, reason string) Decision {
-	n := e.makeNotification(en.Alert, alert.KindResolved)
+	n := e.makeNotification(en.Alert, alert.KindResolved, en.Round)
 	return Decision{
 		Alert:    en.Alert,
+		Round:    en.Round,
 		Outcome:  alert.OutcomeResolvedNotification,
 		Reason:   reason,
 		Messages: []notify.Notification{n},
 	}
 }
 
-func (e *Engine) makeNotification(a alert.Alert, kind alert.EventKind) notify.Notification {
+func (e *Engine) makeNotification(a alert.Alert, kind alert.EventKind, round int) notify.Notification {
 	seq := atomic.AddUint64(&e.notifSeq, 1)
 	labels := make(map[string]string, len(a.Labels))
 	for k, v := range a.Labels {
 		labels[k] = v
 	}
 	return notify.Notification{
-		ID:          a.Fingerprint + "-" + kind.String() + "-" + strconv.FormatUint(seq, 10),
+		ID:          a.Fingerprint + "-r" + strconv.Itoa(round) + "-" + kind.String() + "-" + strconv.FormatUint(seq, 10),
 		Fingerprint: a.Fingerprint,
 		Group:       alert.GroupKey(labels, e.groupBy),
 		Kind:        kind,
+		Round:       round,
 		Labels:      labels,
 		At:          e.clk.Now(),
 	}
 }
 
 // finalize records the decision and dispatches its messages. Inputs were
-// fixed inside the store lock; dispatch itself never touches the store.
+// fixed inside the store lock; dispatch never touches the store. The
+// revalidation predicate is scoped to the notification's own round, so a
+// later round's state change can never brand an earlier round's resolution
+// stale (or vice versa). At the engine level same-fingerprint ingestion is
+// already serialized across the whole dispatch span, which keeps the
+// predicate stable while delivery (including retries) runs; it remains
+// defense in depth and keeps direct dispatcher use meaningful.
 func (e *Engine) finalize(d Decision) {
 	e.rec.RecordDecision(d)
 	for i := range d.Messages {
 		n := d.Messages[i]
 		fp := n.Fingerprint
 		kind := n.Kind
+		round := n.Round
 		e.disp.Dispatch(n, func() bool {
-			cur, ok := e.store.Get(fp)
+			en, ok := e.store.Get(fp)
 			if !ok {
 				return false
 			}
-			switch kind {
-			case alert.KindFiring:
-				return cur.Status == alert.StatePending
-			case alert.KindResolved:
-				return cur.Status == alert.StateResolved
+			r, found := en.RoundByNumber(round)
+			if !found {
+				return false
 			}
-			return true
+			if kind == alert.KindFiring {
+				return r.Status == alert.StatePending
+			}
+			return r.Status == alert.StateResolved
 		})
 	}
 }

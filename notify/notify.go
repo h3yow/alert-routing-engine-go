@@ -16,6 +16,11 @@ type Notification struct {
 	Kind        alert.EventKind
 	Labels      map[string]string
 	At          time.Time
+	// Round is the 1-based fault episode this notification belongs to.
+	// Firing and resolution produced by the same episode share it; a
+	// flapping fingerprint yields independently delivered notifications
+	// for every round.
+	Round int
 	// RuleID records the silence/inhibition rule involved ("" when firing
 	// normally). Only meaningful for policy-recorded notifications.
 	RuleID string
