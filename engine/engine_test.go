@@ -18,8 +18,8 @@ var t0 = time.Date(2026, 9, 28, 8, 0, 0, 0, time.UTC)
 // logDecision prints each input event and the engine's judgment basis.
 func logDecision(t *testing.T, a alert.Alert, d Decision) {
 	t.Helper()
-	t.Logf("input kind=%s fp=%s labels=%v => outcome=%s rule=%q reason=%q messages=%d",
-		a.Kind, a.Fingerprint, a.Labels, d.Outcome, d.RuleID, d.Reason, len(d.Messages))
+	t.Logf("input kind=%s fp=%s labels=%v => round=%d outcome=%s rule=%q reason=%q messages=%d",
+		a.Kind, a.Fingerprint, a.Labels, d.Round, d.Outcome, d.RuleID, d.Reason, len(d.Messages))
 }
 
 type testChannel struct {

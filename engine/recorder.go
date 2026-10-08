@@ -17,6 +17,9 @@ type Decision struct {
 	RuleID   string
 	Reason   string
 	Messages []notify.Notification
+	// Round is the fault episode this decision concerns (0 when the event
+	// never opens a round, e.g. an orphan recovery).
+	Round int
 }
 
 // Recorder collects decisions and terminal delivery results. It is the

@@ -10,7 +10,39 @@ import (
 	"github.com/h3yow/alert-routing-engine-go/alert"
 )
 
+// Round is one fault episode of one fingerprint: from the firing that
+// opened it to the recovery that closed it. A later firing after closure
+// opens a NEW Round; completed rounds stay on record forever and are never
+// overwritten by later ones.
+type Round struct {
+	Number int
+	Alert  alert.Alert
+
+	FiredAt    time.Time
+	ResolvedAt time.Time // zero while the round is open
+
+	// FiringNotified / ResolveNotified are the per-round notification
+	// latches: each round gets at most one firing and one resolution
+	// notification, independently of every other round.
+	FiringNotified  bool
+	ResolveNotified bool
+
+	// Suppressed / Silenced record the most recent policy conclusion for
+	// this round so state remains observable while no notification is sent.
+	Suppressed bool
+	SuppressBy string
+	Silenced   bool
+	SilenceBy  string
+}
+
+// Open reports whether the round has not seen its recovery yet.
+func (r Round) Open() bool { return r.ResolvedAt.IsZero() }
+
 // Entry is the tracked state for one alert fingerprint.
+//
+// The flat fields mirror the CURRENT round (or the entry-level payload for
+// an orphan recovery) and are kept for direct inspection. Full per-round
+// history, including notification latches, lives in Rounds.
 type Entry struct {
 	Alert     alert.Alert
 	Status    alert.Status
@@ -18,8 +50,8 @@ type Entry struct {
 	LastSeen  time.Time
 	UpdatedAt time.Time
 
-	// Notified records that a firing notification was already dispatched.
-	// It is the dedup latch: a repeat firing can never notify twice.
+	// Notified records that the current round's firing notification was
+	// already dispatched. It is the per-round dedup latch mirror.
 	Notified bool
 	// Suppressed / Silenced record the most recent policy conclusion so
 	// state remains observable while no notification is sent.
@@ -27,12 +59,75 @@ type Entry struct {
 	SuppressBy string
 	Silenced   bool
 	SilenceBy  string
+
+	// OrphanResolved marks an entry whose first sighting was a recovery
+	// with no prior firing. A firing afterwards is out of order, NOT a new
+	// round, so the multi-round path cannot swallow orphan handling.
+	OrphanResolved bool
+
+	// RoundNo is the current round number: the open round while pending,
+	// the most recently closed round while resolved. It stays 0 when only
+	// an orphan recovery has ever been seen.
+	RoundNo int
+	// Rounds holds every episode in order, including the open/current one.
+	Rounds []Round
+}
+
+// CurrentRound returns a pointer to the current round, or nil when no
+// round exists (orphan / never fired).
+func (e *Entry) CurrentRound() *Round {
+	if e.RoundNo <= 0 || e.RoundNo > len(e.Rounds) {
+		return nil
+	}
+	return &e.Rounds[e.RoundNo-1]
+}
+
+// OpenRound starts a new fault episode on an entry: round 1 for a brand
+// new entry, or a follow-up round after the previous one closed. It resets
+// the flat per-round view. FirstSeen is entry-level and left untouched.
+// The incoming alert's labels are copied so stored state never aliases a
+// map the caller may keep mutating concurrently.
+func (e *Entry) OpenRound(a alert.Alert, at time.Time) *Round {
+	a.Labels = cloneLabels(a.Labels)
+	num := len(e.Rounds) + 1
+	e.Rounds = append(e.Rounds, Round{Number: num, Alert: a, FiredAt: at})
+	e.RoundNo = num
+	e.Status = alert.StatePending
+	e.OrphanResolved = false
+	e.Alert = a
+	e.LastSeen = at
+	e.UpdatedAt = at
+	e.Notified = false
+	e.Suppressed, e.SuppressBy = false, ""
+	e.Silenced, e.SilenceBy = false, ""
+	return &e.Rounds[num-1]
+}
+
+// SyncFlat mirrors the current round onto the flat inspection fields.
+func (e *Entry) SyncFlat() {
+	r := e.CurrentRound()
+	if r == nil {
+		e.Notified = false
+		e.Suppressed, e.SuppressBy = false, ""
+		e.Silenced, e.SilenceBy = false, ""
+		return
+	}
+	e.Notified = r.FiringNotified
+	e.Suppressed, e.SuppressBy = r.Suppressed, r.SuppressBy
+	e.Silenced, e.SilenceBy = r.Silenced, r.SilenceBy
 }
 
 // Clone returns a value copy safe to read without holding the lock.
 func (e Entry) Clone() Entry {
 	cp := e
 	cp.Alert.Labels = cloneLabels(e.Alert.Labels)
+	if e.Rounds != nil {
+		cp.Rounds = make([]Round, len(e.Rounds))
+		for i := range e.Rounds {
+			cp.Rounds[i] = e.Rounds[i]
+			cp.Rounds[i].Alert.Labels = cloneLabels(e.Rounds[i].Alert.Labels)
+		}
+	}
 	return cp
 }
 

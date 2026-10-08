@@ -27,8 +27,8 @@ func (c *memChannel) Send(ctx context.Context, n notify.Notification) error {
 	if atomic.AddInt32(&c.fail, -1) >= 0 {
 		return fmt.Errorf("channel %s simulated failure", c.name)
 	}
-	fmt.Printf("[channel=%s] deliver kind=%s fp=%s group=%q labels=%v\n",
-		c.name, n.Kind, n.Fingerprint, n.Group, n.Labels)
+	fmt.Printf("[channel=%s] deliver round=%d kind=%s fp=%s group=%q labels=%v\n",
+		c.name, n.Round, n.Kind, n.Fingerprint, n.Group, n.Labels)
 	return nil
 }
 
@@ -73,20 +73,26 @@ func main() {
 	defer eng.Close()
 
 	ctx := context.Background()
+	cpuLabels := map[string]string{"alertname": "CPUHigh", "host": "node-1", "severity": "warning"}
 	events := []alert.Alert{
-		mkAlert("cpu-1", alert.KindFiring, map[string]string{"alertname": "CPUHigh", "host": "node-1", "severity": "warning"}, now),
-		mkAlert("cpu-1", alert.KindFiring, map[string]string{"alertname": "CPUHigh", "host": "node-1", "severity": "warning"}, now), // duplicate
+		mkAlert("cpu-1", alert.KindFiring, cpuLabels, now), // round 1 fires
+		mkAlert("cpu-1", alert.KindFiring, cpuLabels, now), // duplicate within round 1
 		mkAlert("cpu-2", alert.KindFiring, map[string]string{"alertname": "NodeDown", "host": "node-1", "severity": "critical"}, now),
-		mkAlert("cpu-3", alert.KindFiring, map[string]string{"alertname": "CPUHigh", "host": "node-1", "severity": "warning"}, now),   // inhibited by cpu-2
-		mkAlert("cpu-4", alert.KindFiring, map[string]string{"alertname": "DiskFull", "host": "node-3", "severity": "critical"}, now), // silenced
-		mkAlert("ghost", alert.KindResolved, map[string]string{"alertname": "Mystery", "host": "node-9"}, now),                        // orphan
-		mkAlert("cpu-1", alert.KindResolved, map[string]string{"alertname": "CPUHigh", "host": "node-1", "severity": "warning"}, now), // resolution
-		mkAlert("cpu-1", alert.KindFiring, map[string]string{"alertname": "CPUHigh", "host": "node-1", "severity": "warning"}, now),   // out of order
+		mkAlert("cpu-3", alert.KindFiring, cpuLabels, now), // inhibited by cpu-2
+		mkAlert("cpu-4", alert.KindFiring, map[string]string{"alertname": "DiskFull", "host": "node-3", "severity": "critical"}, now),   // silenced
+		mkAlert("ghost", alert.KindResolved, map[string]string{"alertname": "Mystery", "host": "node-9"}, now),                          // orphan
+		mkAlert("cpu-1", alert.KindResolved, cpuLabels, now),                                                                            // round 1 resolves
+		mkAlert("cpu-2", alert.KindResolved, map[string]string{"alertname": "NodeDown", "host": "node-1", "severity": "critical"}, now), // inhibition source clears
+		mkAlert("cpu-1", alert.KindFiring, cpuLabels, now),                                                                              // flapping: round 2 opens, rules now clear -> notifies again
+		mkAlert("cpu-1", alert.KindResolved, cpuLabels, now),                                                                            // round 2 resolves -> 2nd resolution
+		mkAlert("cpu-1", alert.KindResolved, cpuLabels, now),                                                                            // duplicate recovery (no new round)
+		mkAlert("ghost", alert.KindFiring, map[string]string{"alertname": "Mystery", "host": "node-9"}, now),                            // out of order after orphan
 	}
 
 	for _, a := range events {
 		d := eng.Ingest(ctx, a)
-		fmt.Printf("ingest kind=%-8s fp=%-6s -> outcome=%s reason=%s\n", a.Kind, a.Fingerprint, d.Outcome, d.Reason)
+		fmt.Printf("ingest round=%d kind=%-8s fp=%-6s -> outcome=%s reason=%s\n",
+			d.Round, a.Kind, a.Fingerprint, d.Outcome, d.Reason)
 	}
 
 	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -99,10 +105,10 @@ func main() {
 	for _, r := range rec.Results() {
 		switch {
 		case r.Delivered:
-			fmt.Printf("DELIVERED channel=%s id=%s attempts=%d\n", r.Channel, r.Notification.ID, r.Attempts)
+			fmt.Printf("DELIVERED channel=%s round=%d id=%s attempts=%d\n", r.Channel, r.Notification.Round, r.Notification.ID, r.Attempts)
 		default:
-			fmt.Printf("DROPPED   channel=%s id=%s reason=%s attempts=%d err=%v\n",
-				r.Channel, r.Notification.ID, r.DropReason, r.Attempts, r.Err)
+			fmt.Printf("DROPPED   channel=%s round=%d id=%s reason=%s attempts=%d err=%v\n",
+				r.Channel, r.Notification.Round, r.Notification.ID, r.DropReason, r.Attempts, r.Err)
 		}
 	}
 }

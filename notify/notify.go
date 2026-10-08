@@ -16,6 +16,10 @@ type Notification struct {
 	Kind        alert.EventKind
 	Labels      map[string]string
 	At          time.Time
+	// Round identifies the fault episode this notification belongs to.
+	// Every round delivers one firing and (when applicable) one resolution
+	// notification per channel; rounds never replace each other's messages.
+	Round int
 	// RuleID records the silence/inhibition rule involved ("" when firing
 	// normally). Only meaningful for policy-recorded notifications.
 	RuleID string
